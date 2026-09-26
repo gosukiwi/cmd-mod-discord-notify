@@ -32,6 +32,7 @@ interface SentRequest {
 interface FakeMod {
 	cmd: any;
 	emit: (event: string, payload?: any) => void;
+	hook: (name: string, arg?: any) => any;
 	commands: Map<string, (args?: any) => any>;
 	declaredFlags: Map<string, any>;
 	events: Set<string>;
@@ -44,6 +45,7 @@ function makeFakeCmd(options: {cwd?: string; flags?: Record<string, any>} = {}):
 	const declaredFlags = new Map<string, any>();
 	const events = new Set<string>();
 	const notices: string[] = [];
+	const registeredHooks: any[] = [];
 	const flags = new Map<string, any>(Object.entries(options.flags ?? {}));
 
 	return {
@@ -56,6 +58,10 @@ function makeFakeCmd(options: {cwd?: string; flags?: Record<string, any>} = {}):
 			name: 'discord-notify',
 			cwd: options.cwd ?? '/Users/dev/projects/my-app',
 			ui: {notify: (message: string) => notices.push(message)},
+			hooks: (hooks: any) => {
+				registeredHooks.push(hooks);
+				return {dispose: () => {}};
+			},
 			on: (event: string, handler: (payload: any) => void) => {
 				events.add(event);
 				handlers.set(event, [...(handlers.get(event) ?? []), handler]);
@@ -67,6 +73,13 @@ function makeFakeCmd(options: {cwd?: string; flags?: Record<string, any>} = {}):
 		},
 		emit: (event, payload) => {
 			for (const handler of handlers.get(event) ?? []) handler(payload);
+		},
+		hook: (name, arg) => {
+			let result: any;
+			for (const hooks of registeredHooks) {
+				if (typeof hooks[name] === 'function') result = hooks[name](arg);
+			}
+			return result;
 		},
 	};
 }
@@ -92,6 +105,11 @@ function stubFetch(
 
 function embedOf(request: SentRequest): any {
 	return request.payload.embeds[0];
+}
+
+function fieldOf(request: SentRequest, name: string): string | undefined {
+	const fields = embedOf(request).fields ?? [];
+	return fields.find((field: any) => field.name === name)?.value;
 }
 
 // A fresh mod instance per test — the factory holds per-instance state (pending timers,
@@ -137,6 +155,9 @@ test('registers the flags, commands and events it documents', () => {
 		assert.ok(fake.commands.has(command), `missing command ${command}`);
 	}
 	for (const event of [
+		'run_start',
+		'tool_completed',
+		'tool_errored',
 		'permission_mode_changed',
 		'message_end',
 		'tool_queued',
@@ -158,7 +179,7 @@ test('registers the flags, commands and events it documents', () => {
 // run_end / run_error
 // ---------------------------------------------------------------------------
 
-test('run_end sends a Finished ping with stop reason, turns and final text', (t) => {
+test('run_end sends a Finished ping with the outcome and final text', (t) => {
 	const {fake, requests} = withWebhook(t);
 	fake.emit('run_end', {
 		result: {finalText: 'All done, tests pass.', stopReason: 'end_turn', turnCount: 3},
@@ -168,11 +189,202 @@ test('run_end sends a Finished ping with stop reason, turns and final text', (t)
 	assert.equal(requests[0].url, WEBHOOK);
 	const embed = embedOf(requests[0]);
 	assert.equal(embed.title, '✅ Finished');
-	assert.match(embed.description, /stopped: end_turn · 3 turn\(s\)/);
+	assert.equal(fieldOf(requests[0], 'Outcome'), 'Completed normally');
 	assert.match(embed.description, /All done, tests pass\./);
 	assert.equal(embed.color, 0x57f287);
-	assert.match(embed.footer.text, /my-app/);
+	assert.equal(embed.footer.text, 'my-app');
 });
+
+// ---------------------------------------------------------------------------
+// End-of-run delivery
+//
+// Command Code exits as soon as the run ends, so a delivery started from an event
+// observer is killed mid-request. onRunEnd is the one hook the harness awaits, and the
+// finished ping must therefore come from there.
+// ---------------------------------------------------------------------------
+
+test('onRunEnd awaits delivery rather than merely starting it', async (t) => {
+	const {fake, commands, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 1);
+	assert.equal(embedOf(requests[0]).title, '✅ Finished in under a second');
+	// "delivered" proves the request completed, not just that it was issued — this is
+	// exactly what stops the process exiting mid-request.
+	assert.match(commands.get('notify-status')!().message, /last send: ✓ delivered/);
+});
+
+test('onRunEnd and run_end together do not report the same run twice', async (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 1, 'the run_end observer must defer to onRunEnd');
+});
+
+test('run_end still reports if onRunEnd never fired', (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 1);
+});
+
+test('each run is reported once, across several runs', async (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	await fake.hook('onRunEnd', {result: {finalText: 'first', stopReason: 'end_turn'}});
+	fake.emit('run_end', {result: {finalText: 'first', stopReason: 'end_turn'}});
+	assert.equal(requests.length, 1);
+
+	t.mock.timers.tick(3000);
+	fake.emit('run_start', {sessionId: 's1'});
+	await fake.hook('onRunEnd', {result: {finalText: 'second', stopReason: 'end_turn'}});
+	fake.emit('run_end', {result: {finalText: 'second', stopReason: 'end_turn'}});
+	assert.equal(requests.length, 2, 'the next run must still be reported');
+});
+
+test('an error stop reason is reported as a failure, not a finish', async (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	await fake.hook('onRunEnd', {result: {finalText: '', stopReason: 'error'}});
+
+	assert.equal(embedOf(requests[0]).title, '❌ Run failed');
+	assert.match(embedOf(requests[0]).description, /No error detail available/);
+});
+
+test('quiet mode suppresses the end-of-run ping from onRunEnd', async (t) => {
+	const {fake, requests} = withWebhook(t, {'discord-quiet': true});
+
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 0);
+});
+
+test('a ping started earlier in the run is still flushed at run end', async (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	// Kicked off from an observer, so it is only guaranteed by onRunEnd flushing it.
+	fake.emit('message_end', {
+		content: [{type: 'tool_use', name: 'ask_user_question', input: {questions: [{question: 'Which?'}]}}],
+	});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 2);
+	assert.equal(embedOf(requests[0]).title, '🙋 Needs your input');
+});
+
+// ---------------------------------------------------------------------------
+// Context in the message
+// ---------------------------------------------------------------------------
+
+test('the finished ping reports how long the run took', (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	t.mock.timers.tick(134_000); // 2m 14s
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(embedOf(requests[0]).title, '✅ Finished in 2m 14s');
+});
+
+test('a sub-second run is described in words, not "0s"', (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	t.mock.timers.tick(200);
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(embedOf(requests[0]).title, '✅ Finished in under a second');
+});
+
+test('the ping quotes back what you asked for', (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.hook('transformInput', {text: '  refactor   the\nauth module  '});
+	fake.emit('run_end', {result: {finalText: 'done', stopReason: 'end_turn'}});
+
+	// Whitespace is collapsed so it reads as one line on a phone.
+	assert.equal(fieldOf(requests[0], 'You asked'), 'refactor the auth module');
+});
+
+test('transformInput leaves your input completely untouched', (t) => {
+	const {fake} = withWebhook(t);
+	// The hook must only observe — anything but undefined would rewrite the prompt.
+	assert.equal(fake.hook('transformInput', {text: 'hello'}), undefined);
+	assert.equal(fake.hook('transformInput', {text: '   '}), undefined);
+});
+
+test('the ping counts what the run actually did', (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	for (let i = 0; i < 3; i += 1) fake.emit('tool_completed', {});
+	fake.emit('tool_errored', {});
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(fieldOf(requests[0], 'Activity'), '4 tool calls');
+});
+
+test('a single tool call is not reported as "1 tool calls"', (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	fake.emit('tool_completed', {});
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(fieldOf(requests[0], 'Activity'), '1 tool call');
+});
+
+test('a run with no tool calls omits the Activity field', (t) => {
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(fieldOf(requests[0], 'Activity'), undefined);
+});
+
+test('activity is counted per run, not accumulated across runs', (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+
+	fake.emit('run_start', {sessionId: 's1'});
+	fake.emit('tool_completed', {});
+	fake.emit('tool_completed', {});
+	fake.emit('run_end', {result: {finalText: 'first', stopReason: 'end_turn'}});
+	assert.equal(fieldOf(requests[0], 'Activity'), '2 tool calls');
+
+	t.mock.timers.tick(3000);
+	fake.emit('run_start', {sessionId: 's1'});
+	fake.emit('tool_completed', {});
+	fake.emit('run_end', {result: {finalText: 'second', stopReason: 'end_turn'}});
+	assert.equal(fieldOf(requests[1], 'Activity'), '1 tool call');
+});
+
+for (const [raw, expected] of [
+	['permission_denied', 'Stopped — you denied a permission request'],
+	['max_turns', 'Stopped at the turn limit'],
+	['interrupted', 'Interrupted'],
+	['some_new_reason', 'some new reason'],
+] as const) {
+	test(`stop reason "${raw}" is worded for a human`, (t) => {
+		const {fake, requests} = withWebhook(t);
+		fake.emit('run_end', {result: {finalText: 'ok', stopReason: raw}});
+
+		assert.equal(fieldOf(requests[0], 'Outcome'), expected);
+	});
+}
 
 test('run_end escapes backticks so the final text cannot break the code block', (t) => {
 	const {fake, requests} = withWebhook(t);
@@ -203,7 +415,7 @@ test('run_end tolerates a result missing its fields', (t) => {
 	fake.emit('run_end', {});
 
 	assert.equal(requests.length, 1);
-	assert.match(embedOf(requests[0]).description, /stopped: unknown/);
+	assert.equal(fieldOf(requests[0], 'Outcome'), 'unknown');
 	assert.match(embedOf(requests[0]).description, /_No final message\._/);
 });
 
@@ -241,11 +453,11 @@ test('an ask_user_question tool_use triggers a needs-you ping with the question 
 	});
 
 	assert.equal(requests.length, 1);
-	assert.equal(embedOf(requests[0]).title, '🙋 Needs you');
+	assert.equal(embedOf(requests[0]).title, '🙋 Needs your input');
 	assert.match(embedOf(requests[0]).description, /Tabs or spaces\?/);
 });
 
-test('an ask_user_question with several questions notes how many more there are', (t) => {
+test('an ask_user_question with several questions notes the total', (t) => {
 	const {fake, requests} = withWebhook(t);
 	fake.emit('message_end', {
 		content: [
@@ -257,7 +469,9 @@ test('an ask_user_question with several questions notes how many more there are'
 		],
 	});
 
-	assert.match(embedOf(requests[0]).description, /First\? \(\+2 more\)/);
+	const description = embedOf(requests[0]).description;
+	assert.match(description, /First\?/);
+	assert.match(description, /3 questions in total/);
 });
 
 test('an ask_user_question falling back to the generic message still pings', (t) => {
@@ -266,13 +480,13 @@ test('an ask_user_question falling back to the generic message still pings', (t)
 	fake.emit('message_end', {content: [{type: 'tool_use', name: 'ask_user_question', input: {}}]});
 
 	assert.equal(requests.length, 1);
-	assert.match(embedOf(requests[0]).description, /waiting on your input/);
+	assert.match(embedOf(requests[0]).description, /needs something from you/);
 });
 
 for (const [tool, expected] of [
-	['enter_plan_mode', /plan is waiting for your approval/i],
-	['exit_plan_mode', /plan is waiting for your approval/i],
-	['plan_review', /plan is ready for review/i],
+	['enter_plan_mode', /ready for you to approve/i],
+	['exit_plan_mode', /ready for you to approve/i],
+	['plan_review', /ready for you to review/i],
 ] as const) {
 	test(`a ${tool} tool_use triggers a needs-you ping`, (t) => {
 		const {fake, requests} = withWebhook(t);
@@ -295,9 +509,9 @@ test('two different needs-you pings in quick succession both land', (t) => {
 	fake.emit('message_end', {content: [{type: 'tool_use', name: 'plan_review', input: {}}]});
 
 	assert.equal(requests.length, 2);
-	assert.equal(embedOf(requests[0]).title, '🙋 Needs you');
-	assert.equal(embedOf(requests[1]).title, '🙋 Needs you');
-	assert.match(embedOf(requests[1]).description, /ready for review/);
+	assert.equal(embedOf(requests[0]).title, '🙋 Needs your input');
+	assert.equal(embedOf(requests[1]).title, '🙋 Needs your input');
+	assert.match(embedOf(requests[1]).description, /ready for you to review/);
 });
 
 test('an ordinary tool_use does not trigger a ping', (t) => {
@@ -325,9 +539,38 @@ test('a queued tool unanswered for 5s pings, and not before', (t) => {
 
 	t.mock.timers.tick(1);
 	assert.equal(requests.length, 1);
-	assert.equal(embedOf(requests[0]).title, '🔐 Waiting for approval');
+	assert.equal(embedOf(requests[0]).title, '🔐 Waiting for your approval');
 	assert.match(embedOf(requests[0]).description, /shell_command/);
 });
+
+test('the approval ping says what the tool actually wants to do', (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+	fake.emit('tool_queued', {
+		toolCallId: 'c1',
+		toolName: 'shell_command',
+		input: {command: 'npm run build'},
+	});
+	t.mock.timers.tick(5000);
+
+	assert.match(embedOf(requests[0]).description, /npm run build/);
+});
+
+for (const [tool, input, expected] of [
+	['write_file', {file_path: 'src/index.ts'}, /wants to create `src\/index\.ts`/],
+	['edit_file', {file_path: 'src/app.ts'}, /wants to edit `src\/app\.ts`/],
+	['read_file', {absolute_path: '/etc/hosts'}, /wants to read `\/etc\/hosts`/],
+	['mcp__notion__search', {}, /waiting for your permission/],
+] as const) {
+	test(`the approval ping describes ${tool}`, (t) => {
+		useFakeTimers(t);
+		const {fake, requests} = withWebhook(t);
+		fake.emit('tool_queued', {toolCallId: 'c1', toolName: tool, input});
+		t.mock.timers.tick(5000);
+
+		assert.match(embedOf(requests[0]).description, expected);
+	});
+}
 
 test('a queued tool that starts promptly never pings you', (t) => {
 	useFakeTimers(t);
@@ -438,12 +681,16 @@ test('identical pings inside the debounce window collapse into one', (t) => {
 	useFakeTimers(t);
 	const {fake, requests} = withWebhook(t);
 
+	fake.emit('run_start', {});
 	fake.emit('run_error', {error: new Error('same failure')});
 	assert.equal(requests.length, 1);
+
+	fake.emit('run_start', {});
 	fake.emit('run_error', {error: new Error('same failure')});
 	assert.equal(requests.length, 1, 'the identical repeat should be collapsed');
 
 	t.mock.timers.tick(2001);
+	fake.emit('run_start', {});
 	fake.emit('run_error', {error: new Error('same failure')});
 	assert.equal(requests.length, 2, 'after the window it may send again');
 });
@@ -452,10 +699,24 @@ test('distinct failures inside the window are both reported', (t) => {
 	useFakeTimers(t);
 	const {fake, requests} = withWebhook(t);
 
+	fake.emit('run_start', {});
 	fake.emit('run_error', {error: new Error('first problem')});
+	fake.emit('run_start', {});
 	fake.emit('run_error', {error: new Error('second problem')});
 
 	assert.equal(requests.length, 2, 'different errors are different information');
+});
+
+test('one run is never reported as failed twice', (t) => {
+	useFakeTimers(t);
+	const {fake, requests} = withWebhook(t);
+
+	// Same run, so the per-run guard applies even though the text differs.
+	fake.emit('run_start', {});
+	fake.emit('run_error', {error: new Error('first problem')});
+	fake.emit('run_error', {error: new Error('second problem')});
+
+	assert.equal(requests.length, 1);
 });
 
 test('a non-ok webhook response is recorded without throwing', async (t) => {
@@ -505,7 +766,8 @@ test('verbose mode reports each subagent and session event separately', (t) => {
 	fake.emit('session_start', {source: 'startup'});
 
 	assert.equal(requests.length, 2);
-	assert.match(embedOf(requests[0]).description, /explore.*1200 tokens/);
+	assert.match(embedOf(requests[0]).description, /explore/);
+	assert.match(embedOf(requests[0]).description, /1200 tokens/);
 	assert.equal(embedOf(requests[1]).title, '▶️ Session started');
 });
 

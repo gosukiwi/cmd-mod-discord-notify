@@ -44,8 +44,9 @@ const USER_BLOCKING_TOOLS = new Set([
 const PROMPTING_MODES = new Set(['default', 'plan', 'auto-accept']);
 
 const PENDING_MS = 5000; // a tool queued this long unanswered means you're away
-const DEBOUNCE_MS = 2000; // at most one ping per cause per window
+const DEBOUNCE_MS = 2000; // identical notifications inside this window collapse
 const REQUEST_TIMEOUT_MS = 5000;
+const PROMPT_MAX = 300; // how much of your request to quote back
 
 const CONFIG_PATH = join(homedir(), '.commandcode', 'discord-notify.json');
 
@@ -56,8 +57,24 @@ const COLOR = {
 	info: 0x5865f2,
 } as const;
 
+// Raw stop reasons are internal vocabulary; say what they mean instead.
+const STOP_REASON_TEXT: Record<string, string> = {
+	end_turn: 'Completed normally',
+	max_turns: 'Stopped at the turn limit',
+	permission_denied: 'Stopped — you denied a permission request',
+	terminate: 'Stopped early',
+	stop_hook: 'Stopped by a hook',
+	interrupted: 'Interrupted',
+	error: 'Failed',
+};
+
 type Reason = 'needs-you' | 'done' | 'error' | 'info';
 type Source = 'flag' | 'env' | 'config file' | 'none';
+
+interface EmbedField {
+	readonly name: string;
+	readonly value: string;
+}
 
 interface SendOutcome {
 	readonly ok: boolean;
@@ -81,6 +98,13 @@ interface Settings {
 	readonly verbose: boolean;
 }
 
+interface Ping {
+	readonly reason: Reason;
+	readonly title: string;
+	readonly description?: string;
+	readonly fields?: readonly EmbedField[];
+}
+
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
 	return `${text.slice(0, max - 1)}…`;
@@ -89,6 +113,10 @@ function truncate(text: string, max: number): string {
 // Keep content from breaking out of the fenced code block we render it in.
 function fenceSafe(text: string): string {
 	return text.replaceAll('```', "'''");
+}
+
+function codeBlock(text: string, max = 1800): string {
+	return '```\n' + fenceSafe(truncate(text, max)) + '\n```';
 }
 
 function projectName(cwd: string): string {
@@ -106,6 +134,45 @@ function normalizeMention(value: unknown): string | undefined {
 	const raw = nonEmptyString(value);
 	if (raw === undefined) return undefined;
 	return /^\d+$/.test(raw) ? `<@${raw}>` : raw;
+}
+
+function humanDuration(ms: number): string {
+	if (ms < 1000) return 'under a second';
+	const seconds = Math.round(ms / 1000);
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	if (minutes < 60) return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
+	const hours = Math.floor(minutes / 60);
+	const restMinutes = minutes % 60;
+	return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`;
+}
+
+function humanStopReason(raw: string): string {
+	return STOP_REASON_TEXT[raw] ?? raw.replaceAll('_', ' ');
+}
+
+// Describe what a waiting tool is about to do, so the ping is actionable without
+// switching back to the terminal.
+function toolIntent(toolName: string, input: unknown): string | undefined {
+	const record =
+		input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+	if (toolName === 'shell_command') {
+		const command = nonEmptyString(record.command);
+		if (command !== undefined) return `wants to run this command:\n${codeBlock(command, 500)}`;
+	}
+	if (toolName === 'write_file' || toolName === 'edit_file') {
+		const path = nonEmptyString(record.file_path);
+		if (path !== undefined) {
+			const verb = toolName === 'write_file' ? 'create' : 'edit';
+			return `wants to ${verb} \`${fenceSafe(path)}\``;
+		}
+	}
+	if (toolName === 'read_file') {
+		const path = nonEmptyString(record.absolute_path) ?? nonEmptyString(record.file_path);
+		if (path !== undefined) return `wants to read \`${fenceSafe(path)}\``;
+	}
+	return undefined;
 }
 
 export default function (cmd: ModApi): void {
@@ -130,14 +197,24 @@ export default function (cmd: ModApi): void {
 	});
 
 	const pending = new Map<string, ReturnType<typeof setTimeout>>();
-	// Keyed by the specific notification, not just its category: two different "needs you"
-	// pings must both land, and verbose sub-agent events must not cancel each other out.
+	// Keyed by the whole notification, so only byte-identical repeats are collapsed and
+	// any genuinely different event still lands. Dropping a distinct "needs you" ping
+	// would defeat the point of the mod, so this errs toward delivering.
 	const lastSentAt = new Map<string, number>();
+	// Deliveries still in flight. The process exits the moment the run ends, so a send
+	// that isn't awaited here is silently lost — see flush().
+	const inFlight = new Set<Promise<void>>();
 
 	let permissionMode = 'default';
 	let lastOutcome: SendOutcome | undefined;
 	let warnedUnconfigured = false;
 	let cachedConfig: {mtimeMs: number; value: FileConfig} | undefined;
+
+	// Run context, so a ping can say what it was about rather than just that it happened.
+	let lastUserPrompt: string | undefined;
+	let runStartedAt: number | undefined;
+	let toolCallsThisRun = 0;
+	let reportedEnd: 'none' | 'success' | 'failure' = 'none';
 
 	// Re-read when the file changes so edits land without a /reload.
 	function readConfigFile(): FileConfig {
@@ -202,7 +279,7 @@ export default function (cmd: ModApi): void {
 		};
 	}
 
-	async function deliver(reason: Reason, title: string, description: string): Promise<void> {
+	async function deliver(content: Ping): Promise<void> {
 		const settings = resolveSettings();
 		if (!settings.webhook) {
 			if (!warnedUnconfigured) {
@@ -224,11 +301,19 @@ export default function (cmd: ModApi): void {
 			...(mention ? {allowed_mentions: {parse: ['users', 'roles', 'everyone']}} : {}),
 			embeds: [
 				{
-					title: truncate(title, 256),
-					description: truncate(description, 4096) || undefined,
-					color: COLOR[reason],
+					title: truncate(content.title, 256),
+					description: content.description ? truncate(content.description, 4096) : undefined,
+					color: COLOR[content.reason],
 					timestamp: new Date().toISOString(),
-					footer: {text: `${projectName(cmd.cwd)} · ${reason}`},
+					...(content.fields && content.fields.length > 0
+						? {
+								fields: content.fields.map((field) => ({
+									name: truncate(field.name, 256),
+									value: truncate(field.value, 1024),
+								})),
+							}
+						: {}),
+					footer: {text: projectName(cmd.cwd)},
 				},
 			],
 		};
@@ -260,16 +345,24 @@ export default function (cmd: ModApi): void {
 
 	// Debounced, fire-and-forget. A notification must never stall the agent loop,
 	// so nothing here is awaited by a caller on the hot path.
-	function ping(reason: Reason, title: string, description: string): void {
+	function ping(content: Ping): void {
 		const now = Date.now();
-		// Keyed by the whole notification, so only byte-identical repeats are collapsed and
-		// any genuinely different event still lands. Dropping a distinct "needs you" ping
-		// would defeat the point of the mod, so this errs toward delivering.
-		const key = `${reason}\u0000${title}\u0000${description}`;
+		const key = JSON.stringify(content);
 		const previous = lastSentAt.get(key) ?? 0;
 		if (now - previous < DEBOUNCE_MS) return;
 		lastSentAt.set(key, now);
-		void deliver(reason, title, description);
+		const task = deliver(content);
+		inFlight.add(task);
+		void task.finally(() => inFlight.delete(task));
+	}
+
+	// Wait for every delivery started so far. Command Code exits as soon as the run ends,
+	// so a fire-and-forget fetch from an event observer dies mid-request and the ping is
+	// lost. This is called from the awaited `onRunEnd` hook, which the harness waits for.
+	async function flush(): Promise<void> {
+		while (inFlight.size > 0) {
+			await Promise.allSettled([...inFlight]);
+		}
 	}
 
 	function clearPending(id: string): void {
@@ -283,6 +376,12 @@ export default function (cmd: ModApi): void {
 		pending.clear();
 	}
 
+	// "What was this about?" — the single most useful piece of context on a phone.
+	function promptField(): EmbedField[] {
+		if (!lastUserPrompt) return [];
+		return [{name: 'You asked', value: lastUserPrompt}];
+	}
+
 	function summarizeRequest(name: string, input: unknown): string {
 		if (name === 'ask_user_question' && input && typeof input === 'object') {
 			const questions = (input as {questions?: unknown}).questions;
@@ -291,20 +390,108 @@ export default function (cmd: ModApi): void {
 				if (first && typeof first === 'object' && 'question' in first) {
 					const text = (first as {question?: unknown}).question;
 					if (typeof text === 'string' && text.trim() !== '') {
-						const extra = questions.length > 1 ? ` (+${questions.length - 1} more)` : '';
-						return `Question: ${text}${extra}`;
+						const extra =
+							questions.length > 1
+								? `\n\n_${questions.length} questions in total._`
+								: '';
+						return `${text.trim()}${extra}`;
 					}
 				}
 			}
 		}
 		if (name === 'enter_plan_mode' || name === 'exit_plan_mode') {
-			return 'A plan is waiting for your approval.';
+			return 'A plan is ready for you to approve.';
 		}
 		if (name === 'plan_review') {
-			return 'A plan is ready for review.';
+			return 'A plan is ready for you to review.';
 		}
-		return 'The agent is waiting on your input.';
+		return 'The agent needs something from you.';
 	}
+
+	// Report how the run ended. Driven by the awaited onRunEnd hook, with the event
+	// fallbacks below as a safety net.
+	function reportEnd(options: {result?: any; error?: unknown}): void {
+		const stopReason =
+			typeof options.result?.stopReason === 'string' ? options.result.stopReason : undefined;
+		const failure = options.error !== undefined || stopReason === 'error';
+		// A late failure report is allowed to supersede a success one; never the reverse.
+		if (failure ? reportedEnd === 'failure' : reportedEnd !== 'none') return;
+
+		const elapsed = runStartedAt === undefined ? undefined : Date.now() - runStartedAt;
+		const calls = toolCallsThisRun;
+		if (reportedEnd === 'none') {
+			runStartedAt = undefined;
+			toolCallsThisRun = 0;
+		}
+		reportedEnd = failure ? 'failure' : 'success';
+
+		if (resolveSettings().quiet) return;
+
+		if (failure) {
+			const finalText = typeof options.result?.finalText === 'string' ? options.result.finalText.trim() : '';
+			const detail =
+				options.error instanceof Error
+					? options.error.message
+					: options.error !== undefined
+						? String(options.error)
+						: finalText !== ''
+							? finalText
+							: 'No error detail available.';
+			ping({
+				reason: 'error',
+				title: '❌ Run failed',
+				description: codeBlock(detail),
+				fields: promptField(),
+			});
+			return;
+		}
+
+		const finalText =
+			typeof options.result?.finalText === 'string' ? options.result.finalText.trim() : '';
+		ping({
+			reason: 'done',
+			title: elapsed === undefined ? '✅ Finished' : `✅ Finished in ${humanDuration(elapsed)}`,
+			description: finalText === '' ? '_No final message._' : codeBlock(finalText),
+			fields: [
+				...promptField(),
+				{name: 'Outcome', value: humanStopReason(stopReason ?? 'unknown')},
+				...(calls === 0
+					? []
+					: [{name: 'Activity', value: calls === 1 ? '1 tool call' : `${calls} tool calls`}]),
+			],
+		});
+	}
+
+	// Remember what you typed, so later pings can quote it back. Returning undefined
+	// leaves your input completely untouched — this only observes.
+	cmd.hooks({
+		transformInput: ({text}) => {
+			const collapsed = text.replace(/\s+/g, ' ').trim();
+			if (collapsed !== '') lastUserPrompt = truncate(collapsed, PROMPT_MAX);
+			return undefined;
+		},
+		// This is why the mod works at all under `cmd -p`. The harness AWAITS onRunEnd, so a
+		// send started here completes before the process exits. Event observers are never
+		// awaited, and a delivery started from one gets killed mid-request.
+		onRunEnd: async ({result}) => {
+			clearAllPending();
+			reportEnd({result});
+			await flush();
+		},
+	});
+
+	cmd.on('run_start', () => {
+		runStartedAt = Date.now();
+		toolCallsThisRun = 0;
+		reportedEnd = 'none';
+	});
+
+	cmd.on('tool_completed', () => {
+		toolCallsThisRun += 1;
+	});
+	cmd.on('tool_errored', () => {
+		toolCallsThisRun += 1;
+	});
 
 	cmd.on('permission_mode_changed', ({mode}) => {
 		permissionMode = mode;
@@ -320,25 +507,35 @@ export default function (cmd: ModApi): void {
 			if (typed.type !== 'tool_use') continue;
 			if (typeof typed.name !== 'string') continue;
 			if (!USER_BLOCKING_TOOLS.has(typed.name)) continue;
-			ping('needs-you', '🙋 Needs you', summarizeRequest(typed.name, typed.input));
+			ping({
+				reason: 'needs-you',
+				title: '🙋 Needs your input',
+				description: summarizeRequest(typed.name, typed.input),
+				fields: promptField(),
+			});
 			return;
 		}
 	});
 
 	// A queued tool that never starts means an approval modal is sitting there.
 	// Answer it quickly and you never get pinged.
-	cmd.on('tool_queued', ({toolCallId, toolName}) => {
+	cmd.on('tool_queued', ({toolCallId, toolName, input}) => {
 		if (!PROMPTING_MODES.has(permissionMode)) return;
 		if (USER_BLOCKING_TOOLS.has(toolName)) return;
 		pending.set(
 			toolCallId,
 			setTimeout(() => {
 				pending.delete(toolCallId);
-				ping(
-					'needs-you',
-					'🔐 Waiting for approval',
-					'`' + fenceSafe(toolName) + '` is waiting for your permission.',
-				);
+				const intent = toolIntent(toolName, input);
+				ping({
+					reason: 'needs-you',
+					title: '🔐 Waiting for your approval',
+					description:
+						intent === undefined
+							? `\`${fenceSafe(toolName)}\` is waiting for your permission.`
+							: `\`${fenceSafe(toolName)}\` ${intent}`,
+					fields: promptField(),
+				});
 			}, PENDING_MS),
 		);
 	});
@@ -347,49 +544,56 @@ export default function (cmd: ModApi): void {
 	cmd.on('tool_denied', ({toolCallId}) => clearPending(toolCallId));
 	cmd.on('interrupted', clearAllPending);
 
+	// Safety nets only — onRunEnd above fires first and normally handles this. Event
+	// observers cannot await delivery, so a fallback ping may still be lost under `cmd -p`;
+	// it exists so that a miss is at worst silent rather than always silent.
 	cmd.on('run_end', ({result}) => {
 		clearAllPending();
-		if (resolveSettings().quiet) return;
-		const finalText = typeof result?.finalText === 'string' ? result.finalText.trim() : '';
-		const stopReason = result?.stopReason ?? 'unknown';
-		const turns = typeof result?.turnCount === 'number' ? result.turnCount : undefined;
-		const header =
-			turns === undefined
-				? `stopped: ${stopReason}`
-				: `stopped: ${stopReason} · ${turns} turn(s)`;
-		const body =
-			finalText === ''
-				? '_No final message._'
-				: '```\n' + fenceSafe(truncate(finalText, 1800)) + '\n```';
-		ping('done', '✅ Finished', `${header}\n\n${body}`);
+		reportEnd({result});
 	});
 
 	cmd.on('run_error', ({error}) => {
 		clearAllPending();
-		if (resolveSettings().quiet) return;
-		const message = error instanceof Error ? error.message : String(error);
-		ping('error', '❌ Run failed', '```\n' + fenceSafe(truncate(message, 1800)) + '\n```');
+		reportEnd({error});
 	});
 
 	cmd.on('subagent_start', ({subagentType}) => {
 		if (!resolveSettings().verbose) return;
-		ping('info', '🤖 Sub-agent started', '`' + fenceSafe(String(subagentType)) + '`');
+		ping({
+			reason: 'info',
+			title: '🤖 Sub-agent started',
+			description: `\`${fenceSafe(String(subagentType))}\` is working on it.`,
+			fields: promptField(),
+		});
 	});
 
 	cmd.on('subagent_stop', ({subagentType, tokensUsed}) => {
 		if (!resolveSettings().verbose) return;
-		const tokens = typeof tokensUsed === 'number' ? ` · ${tokensUsed} tokens` : '';
-		ping('info', '🤖 Sub-agent done', '`' + fenceSafe(String(subagentType)) + '`' + tokens);
+		const tokens = typeof tokensUsed === 'number' ? `\n_${tokensUsed} tokens used._` : '';
+		ping({
+			reason: 'info',
+			title: '🤖 Sub-agent finished',
+			description: `\`${fenceSafe(String(subagentType))}\` is done.${tokens}`,
+			fields: promptField(),
+		});
 	});
 
 	cmd.on('session_start', () => {
 		if (!resolveSettings().verbose) return;
-		ping('info', '▶️ Session started', '`' + fenceSafe(projectName(cmd.cwd)) + '`');
+		ping({
+			reason: 'info',
+			title: '▶️ Session started',
+			description: `Working in \`${fenceSafe(projectName(cmd.cwd))}\`.`,
+		});
 	});
 
 	cmd.on('session_shutdown', () => {
 		if (!resolveSettings().verbose) return;
-		ping('info', '⏹ Session ended', '`' + fenceSafe(projectName(cmd.cwd)) + '`');
+		ping({
+			reason: 'info',
+			title: '⏹ Session ended',
+			description: `Finished in \`${fenceSafe(projectName(cmd.cwd))}\`.`,
+		});
 	});
 
 	cmd.addCommand({
@@ -403,11 +607,12 @@ export default function (cmd: ModApi): void {
 				};
 			}
 			lastSentAt.clear();
-			void deliver(
-				'info',
-				'👋 Test notification',
-				'If you can read this on your phone, Command Code pings are working.',
-			).then(() => {
+			void deliver({
+				reason: 'info',
+				title: '👋 Test notification',
+				description: 'If you can read this on your phone, Command Code pings are working.',
+				fields: promptField(),
+			}).then(() => {
 				if (!lastOutcome) return;
 				cmd.ui.notify(
 					lastOutcome.ok
@@ -430,6 +635,7 @@ export default function (cmd: ModApi): void {
 				`mention: ${settings.mention ?? 'none'} (${settings.mentionSource})`,
 				`quiet: ${settings.quiet ? 'on' : 'off'}   verbose: ${settings.verbose ? 'on' : 'off'}`,
 				`permission mode: ${permissionMode}`,
+				`last request: ${lastUserPrompt ?? 'nothing captured yet'}`,
 				lastOutcome
 					? `last send: ${lastOutcome.ok ? '✓' : '✗'} ${lastOutcome.detail} at ${new Date(lastOutcome.at).toLocaleTimeString()}`
 					: 'last send: nothing sent yet this session',

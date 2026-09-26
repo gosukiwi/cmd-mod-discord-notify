@@ -47,11 +47,19 @@ restarting. Verify with `/notify-status` and `/notify-test` in a session.
 
 | Ping | When |
 |---|---|
-| 🙋 **Needs you** | The agent calls `ask_user_question`, or presents a plan for approval. These panels are TUI-side and fire no tool events, so they're detected via the finished message's `tool_use` block. Includes the question text. |
-| 🔐 **Waiting for approval** | A tool sat queued for 5s without starting — i.e. an approval modal is up. Approve quickly and you're never pinged. |
-| ✅ **Finished** | A run ends. Carries the stop reason, turn count, and the final message. |
-| ❌ **Run failed** | A non-retryable run error. |
+| 🙋 **Needs your input** | The agent calls `ask_user_question`, or presents a plan for approval. These panels are TUI-side and fire no tool events, so they're detected via the finished message's `tool_use` block. Includes the question text. |
+| 🔐 **Waiting for your approval** | A tool sat queued for 5s without starting — i.e. an approval modal is up. Says what the tool is about to do (the command, or the file it will write). Approve quickly and you're never pinged. |
+| ✅ **Finished** | A run ends. Shows how long it took, how it ended in plain words, how many tool calls it made, and the final message. |
+| ❌ **Run failed** | A non-retryable run error, with the error text. |
 | 🤖▶️⏹ *info* | Sub-agent start/stop and session start/end, only with `verbose`. |
+
+Stop reasons are translated rather than passed through — you get *"Stopped — you denied a
+permission request"* instead of `permission_denied`.
+
+Pings also quote back what you asked for, in a `You asked` field. That comes from the typed
+input seam, so it appears in interactive sessions but **not** in `cmd -p` runs, where the
+prompt arrives on the command line instead. The field is simply omitted when there's
+nothing captured.
 
 Delivery is fire-and-forget, so a slow or failing webhook can never stall the agent loop.
 Byte-identical notifications arriving within 2s of each other are collapsed into one;
