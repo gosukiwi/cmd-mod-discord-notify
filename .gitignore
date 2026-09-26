@@ -1,0 +1,6 @@
+# Command Code's own per-project state — permission settings and auto-managed taste
+# learnings. Not part of the mod, and machine-specific.
+.commandcode/
+
+# macOS
+.DS_Store
