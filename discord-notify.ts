@@ -26,9 +26,9 @@
 // silent. Either set a mention here, or set the channel's notification level to
 // "All Messages". Then run /notify-test to confirm it reaches your phone.
 
-import {readFileSync, statSync} from 'node:fs';
+import {chmodSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync} from 'node:fs';
 import {homedir} from 'node:os';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
 import type {ModApi} from '@commandcode/harness';
 
 // Tools whose panels live in the TUI and fire no tool events of their own — the
@@ -87,6 +87,7 @@ interface FileConfig {
 	readonly mention?: string;
 	readonly quiet?: boolean;
 	readonly verbose?: boolean;
+	readonly enabled?: boolean;
 }
 
 interface Settings {
@@ -96,6 +97,7 @@ interface Settings {
 	readonly mentionSource: Source;
 	readonly quiet: boolean;
 	readonly verbose: boolean;
+	readonly enabled: boolean;
 }
 
 interface Ping {
@@ -252,6 +254,7 @@ export default function (cmd: ModApi): void {
 					mention: nonEmptyString(raw.mention),
 					quiet: typeof raw.quiet === 'boolean' ? raw.quiet : undefined,
 					verbose: typeof raw.verbose === 'boolean' ? raw.verbose : undefined,
+					enabled: typeof raw.enabled === 'boolean' ? raw.enabled : undefined,
 				};
 			}
 		} catch {
@@ -291,7 +294,39 @@ export default function (cmd: ModApi): void {
 			mentionSource,
 			quiet: typeof flagQuiet === 'boolean' ? flagQuiet : file.quiet === true,
 			verbose: typeof flagVerbose === 'boolean' ? flagVerbose : file.verbose === true,
+			// Muting is a file-only setting, and an absent field means "on", so an existing
+			// config without it keeps working exactly as before.
+			enabled: file.enabled !== false,
 		};
+	}
+
+	// Rewrite the config with a patch applied. Reads the raw JSON first so keys this mod
+	// doesn't know about survive, and writes via a temp file + rename so an interrupted
+	// write can't leave a truncated config behind.
+	function updateConfigFile(patch: Record<string, unknown>): void {
+		let current: Record<string, unknown> = {};
+		try {
+			const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+				current = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// Missing or malformed: start fresh rather than fail the command.
+		}
+
+		let mode = 0o600; // it holds a webhook credential
+		try {
+			mode = statSync(CONFIG_PATH).mode & 0o777;
+		} catch {
+			// Brand new file — keep the 0600 default.
+		}
+
+		mkdirSync(dirname(CONFIG_PATH), {recursive: true});
+		const temporary = `${CONFIG_PATH}.tmp`;
+		writeFileSync(temporary, `${JSON.stringify({...current, ...patch}, null, 2)}\n`, {mode});
+		chmodSync(temporary, mode);
+		renameSync(temporary, CONFIG_PATH);
+		cachedConfig = undefined; // take effect at once, without waiting for an mtime change
 	}
 
 	// cmd.ui.notify draws a feed row in the interactive TUI but prints nothing at all under
@@ -308,6 +343,9 @@ export default function (cmd: ModApi): void {
 
 	async function deliver(content: Ping): Promise<void> {
 		const settings = resolveSettings();
+		// Muted: stay completely silent, which also means no failure warnings — being told
+		// about a notification you asked not to receive would be noise.
+		if (!settings.enabled) return;
 		if (!settings.webhook) {
 			if (!warnedUnconfigured) {
 				warnedUnconfigured = true;
@@ -638,10 +676,41 @@ export default function (cmd: ModApi): void {
 	});
 
 	cmd.addCommand({
+		name: 'notify-enable',
+		description: 'Unmute Discord notifications',
+		handler: () => {
+			const wasEnabled = resolveSettings().enabled;
+			updateConfigFile({enabled: true});
+			return {message: wasEnabled ? 'Notifications are already on.' : 'Notifications on.'};
+		},
+	});
+
+	cmd.addCommand({
+		name: 'notify-disable',
+		description: 'Mute Discord notifications until you turn them back on',
+		handler: () => {
+			const settings = resolveSettings();
+			updateConfigFile({enabled: false});
+			if (!settings.enabled) return {message: 'Notifications are already muted.'};
+			const note = settings.webhook
+				? ''
+				: ' No webhook is configured, so nothing was being sent anyway.';
+			return {
+				message: `Notifications muted — run /notify-enable to unmute.${note}`,
+			};
+		},
+	});
+
+	cmd.addCommand({
 		name: 'notify-test',
 		description: 'Send a test notification to your Discord webhook',
 		handler: () => {
 			const settings = resolveSettings();
+			if (!settings.enabled) {
+				return {
+					message: 'Notifications are muted, so nothing was sent. Run /notify-enable first.',
+				};
+			}
 			if (!settings.webhook) {
 				return {
 					message: `No webhook configured. Add {"webhook": "https://discord.com/api/webhooks/..."} to ${CONFIG_PATH} and run /notify-test again.`,
@@ -672,6 +741,7 @@ export default function (cmd: ModApi): void {
 			const settings = resolveSettings();
 			const lines = [
 				`config file: ${CONFIG_PATH}`,
+				`notifications: ${settings.enabled ? 'on' : 'MUTED'} — ${settings.enabled ? '/notify-disable to mute' : '/notify-enable to unmute'}`,
 				`webhook: ${settings.webhook ? 'configured ✓' : 'NOT configured'} (${settings.webhookSource})`,
 				`mention: ${settings.mention ?? 'none'} (${settings.mentionSource})`,
 				`quiet: ${settings.quiet ? 'on' : 'off'}   verbose: ${settings.verbose ? 'on' : 'off'}`,

@@ -21,7 +21,8 @@ Everything lives in `~/.commandcode/discord-notify.json`:
   "webhook": "https://discord.com/api/webhooks/...",
   "mention": "123456789012345678",
   "quiet": false,
-  "verbose": false
+  "verbose": false,
+  "enabled": true
 }
 ```
 
@@ -31,6 +32,7 @@ Everything lives in `~/.commandcode/discord-notify.json`:
 | `mention` | effectively yes | Your Discord user id. Bare digits are fine — they're normalized to `<@id>`. |
 | `quiet` | no | `true` = only ping when the agent is blocked on you, no "finished" pings. |
 | `verbose` | no | `true` = also ping on sub-agent activity and session start/end. |
+| `enabled` | no | `false` mutes everything. Absent means on. |
 
 **Why `mention` matters:** Discord's default channel notification setting is *"Only
 @mentions"*, and a webhook mentions nobody — so without it the POST succeeds but your
@@ -41,7 +43,21 @@ Get your user id: Discord → Settings → Advanced → **Developer Mode** on �
 your avatar → *Copy User ID*.
 
 The config file is re-read when it changes, so you can edit it and re-test without
-restarting. Verify with `/notify-status` and `/notify-test` in a session.
+restarting.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/notify-test` | Send a test ping so you can confirm it reaches your phone. |
+| `/notify-status` | Show the current config, the mute state, and the last delivery result. |
+| `/notify-disable` | Mute notifications until you turn them back on. |
+| `/notify-enable` | Unmute. |
+
+Muting is written to the config file, so it survives restarts and applies to every project —
+it is not just for the current session. While muted, delivery is skipped entirely, including
+the "could not be delivered" warning: being told about a notification you asked not to
+receive would be noise.
 
 ## What triggers a ping
 

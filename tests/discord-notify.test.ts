@@ -10,7 +10,7 @@
 
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync, mkdirSync, rmSync, writeFileSync} from 'node:fs';
+import {chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
@@ -155,7 +155,7 @@ test('registers the flags, commands and events it documents', () => {
 	assert.equal(fake.declaredFlags.get('discord-quiet').default, undefined);
 	assert.equal(fake.declaredFlags.get('discord-verbose').default, undefined);
 
-	for (const command of ['notify-test', 'notify-status']) {
+	for (const command of ['notify-test', 'notify-status', 'notify-enable', 'notify-disable']) {
 		assert.ok(fake.commands.has(command), `missing command ${command}`);
 	}
 	for (const event of [
@@ -1004,4 +1004,135 @@ test('notify-status reports an unconfigured mod without throwing', (t) => {
 	const status = fake.commands.get('notify-status')!().message;
 	assert.match(status, /webhook: NOT configured \(none\)/);
 	assert.match(status, /last send: nothing sent yet/);
+});
+
+// ---------------------------------------------------------------------------
+// Muting
+// ---------------------------------------------------------------------------
+
+// Mute state lives in the config file, so these need a real file at $HOME.
+async function withConfigFile(content: Record<string, unknown>, t: any) {
+	const {createMod: freshMod, home} = await importWithConfig(JSON.stringify(content));
+	t.after(() => rmSync(home, {recursive: true, force: true}));
+	const fake = makeFakeCmd();
+	freshMod(fake.cmd);
+	const requests = stubFetch(t);
+	return {fake, requests, configPath: join(home, '.commandcode', 'discord-notify.json')};
+}
+
+function readConfig(configPath: string): any {
+	return JSON.parse(readFileSync(configPath, 'utf8'));
+}
+
+test('a muted config suppresses every kind of ping, silently', async (t) => {
+	const {fake, requests} = await withConfigFile(
+		{webhook: 'http://file.test/hook', enabled: false, verbose: true},
+		t,
+	);
+
+	fake.emit('message_end', {
+		content: [{type: 'tool_use', name: 'ask_user_question', input: {questions: [{question: 'Hi?'}]}}],
+	});
+	fake.emit('session_start', {source: 'startup'});
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+	fake.emit('run_error', {error: new Error('boom')});
+
+	assert.equal(requests.length, 0);
+	assert.equal(fake.notices.length, 0, 'muting must not produce warnings either');
+});
+
+test('a config with no enabled field still sends', async (t) => {
+	const {fake, requests} = await withConfigFile({webhook: 'http://file.test/hook'}, t);
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 1, 'absent means on, so existing configs keep working');
+});
+
+test('notify-disable and notify-enable persist the mute state', async (t) => {
+	const {fake, configPath} = await withConfigFile({webhook: 'http://file.test/hook'}, t);
+
+	assert.match(fake.commands.get('notify-disable')!().message, /muted/i);
+	assert.equal(readConfig(configPath).enabled, false);
+
+	assert.match(fake.commands.get('notify-enable')!().message, /Notifications on\./);
+	assert.equal(readConfig(configPath).enabled, true);
+});
+
+test('muting takes effect immediately, with no reload', async (t) => {
+	const {fake, requests} = await withConfigFile({webhook: 'http://file.test/hook'}, t);
+
+	fake.commands.get('notify-disable')!();
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 0);
+});
+
+test('unmuting restores delivery', async (t) => {
+	const {fake, requests} = await withConfigFile(
+		{webhook: 'http://file.test/hook', enabled: false},
+		t,
+	);
+
+	fake.commands.get('notify-enable')!();
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(requests.length, 1);
+});
+
+test('toggling mute preserves other settings, unknown keys and the file mode', async (t) => {
+	const {fake, configPath} = await withConfigFile(
+		{webhook: 'http://file.test/hook', mention: '42', quiet: true, futureOption: 'kept'},
+		t,
+	);
+	chmodSync(configPath, 0o600);
+
+	fake.commands.get('notify-disable')!();
+
+	const written = readConfig(configPath);
+	assert.equal(written.webhook, 'http://file.test/hook');
+	assert.equal(written.mention, '42');
+	assert.equal(written.quiet, true);
+	assert.equal(written.futureOption, 'kept', 'keys the mod does not know must survive a rewrite');
+	assert.equal(written.enabled, false);
+	assert.equal(statSync(configPath).mode & 0o777, 0o600, 'the creds file must stay private');
+});
+
+test('toggling mute is idempotent and says which state you are in', async (t) => {
+	const {fake} = await withConfigFile({webhook: 'http://file.test/hook'}, t);
+
+	fake.commands.get('notify-disable')!();
+	assert.match(fake.commands.get('notify-disable')!().message, /already muted/i);
+
+	fake.commands.get('notify-enable')!();
+	assert.match(fake.commands.get('notify-enable')!().message, /already on/i);
+});
+
+test('notify-disable mentions that there was no webhook to begin with', async (t) => {
+	const {fake} = await withConfigFile({}, t);
+
+	assert.match(fake.commands.get('notify-disable')!().message, /nothing was being sent anyway/);
+});
+
+test('notify-test refuses while muted instead of sending anyway', async (t) => {
+	const {fake, requests} = await withConfigFile(
+		{webhook: 'http://file.test/hook', enabled: false},
+		t,
+	);
+
+	const result = fake.commands.get('notify-test')!();
+
+	assert.match(result.message, /muted/i);
+	assert.match(result.message, /notify-enable/);
+	assert.equal(requests.length, 0);
+});
+
+test('notify-status reports the muted state', async (t) => {
+	const {fake} = await withConfigFile({webhook: 'http://file.test/hook', enabled: false}, t);
+
+	assert.match(fake.commands.get('notify-status')!().message, /notifications: MUTED/);
 });
