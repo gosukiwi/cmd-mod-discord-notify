@@ -53,8 +53,10 @@ restarting. Verify with `/notify-status` and `/notify-test` in a session.
 | ❌ **Run failed** | A non-retryable run error. |
 | 🤖▶️⏹ *info* | Sub-agent start/stop and session start/end, only with `verbose`. |
 
-Delivery is debounced (at most one ping per cause per 2s) and fire-and-forget, so a slow
-or failing webhook can never stall the agent loop.
+Delivery is fire-and-forget, so a slow or failing webhook can never stall the agent loop.
+Byte-identical notifications arriving within 2s of each other are collapsed into one;
+anything genuinely different is always delivered, so two distinct "needs you" events in
+quick succession both reach you.
 
 ## Uninstall
 
@@ -69,3 +71,15 @@ bin/uninstall --purge   # also delete the config (it holds your webhook URL)
   logged and never sent to the model.
 - `COMMANDCODE_MODS_DIR` overrides the install destination for both scripts.
 - After editing `discord-notify.ts`, re-run `bin/install` and `/reload`.
+
+## Tests
+
+```bash
+npm test
+```
+
+Zero dependencies — the suite runs on Node's built-in test runner, driving the real mod
+factory against a fake `ModApi` with `fetch` stubbed. Nothing touches the network, and the
+tests redirect `$HOME` to a throwaway directory so they can never read your real config or
+fire at your real webhook. Requires Node 24+, which imports the TypeScript source directly
+via native type stripping.

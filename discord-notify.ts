@@ -130,7 +130,9 @@ export default function (cmd: ModApi): void {
 	});
 
 	const pending = new Map<string, ReturnType<typeof setTimeout>>();
-	const lastSentAt = new Map<Reason, number>();
+	// Keyed by the specific notification, not just its category: two different "needs you"
+	// pings must both land, and verbose sub-agent events must not cancel each other out.
+	const lastSentAt = new Map<string, number>();
 
 	let permissionMode = 'default';
 	let lastOutcome: SendOutcome | undefined;
@@ -260,9 +262,13 @@ export default function (cmd: ModApi): void {
 	// so nothing here is awaited by a caller on the hot path.
 	function ping(reason: Reason, title: string, description: string): void {
 		const now = Date.now();
-		const previous = lastSentAt.get(reason) ?? 0;
+		// Keyed by the whole notification, so only byte-identical repeats are collapsed and
+		// any genuinely different event still lands. Dropping a distinct "needs you" ping
+		// would defeat the point of the mod, so this errs toward delivering.
+		const key = `${reason}\u0000${title}\u0000${description}`;
+		const previous = lastSentAt.get(key) ?? 0;
 		if (now - previous < DEBOUNCE_MS) return;
-		lastSentAt.set(reason, now);
+		lastSentAt.set(key, now);
 		void deliver(reason, title, description);
 	}
 
