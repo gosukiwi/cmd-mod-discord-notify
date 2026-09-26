@@ -77,6 +77,10 @@ bin/uninstall --purge   # also delete the config (it holds your webhook URL)
 
 - Sends only to the webhook you configure. The webhook is treated as a secret: it's never
   logged and never sent to the model.
+- A failed delivery is reported once per outage — not once per notification — naming the
+  reason (`HTTP 401`, `fetch failed (ECONNREFUSED)`, `timed out`). It appears as a feed row
+  in the TUI, or on **stderr** under `cmd -p`, where `cmd.ui.notify` prints nothing.
+  `/notify-status` shows the last outcome.
 - `COMMANDCODE_MODS_DIR` overrides the install destination for both scripts.
 - After editing `discord-notify.ts`, re-run `bin/install` and `/reload`.
 

@@ -57,7 +57,11 @@ function makeFakeCmd(options: {cwd?: string; flags?: Record<string, any>} = {}):
 		cmd: {
 			name: 'discord-notify',
 			cwd: options.cwd ?? '/Users/dev/projects/my-app',
-			ui: {notify: (message: string) => notices.push(message)},
+			ui: {
+				notify: (message: string) => notices.push(message),
+				// Stands in for the interactive TUI, where warnings become feed rows.
+				capabilities: {status: true},
+			},
 			hooks: (hooks: any) => {
 				registeredHooks.push(hooks);
 				return {dispose: () => {}};
@@ -731,17 +735,120 @@ test('a non-ok webhook response is recorded without throwing', async (t) => {
 });
 
 test('a network failure is swallowed so it cannot stall the agent loop', async (t) => {
-	const {fake} = withWebhook(t);
+	const {fake, notices} = withWebhook(t);
 	globalThis.fetch = (async () => {
 		throw new Error('ECONNREFUSED');
 	}) as any;
 
 	assert.doesNotThrow(() => {
-		fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn', turnCount: 1}});
+		fake.emit('run_start', {});
+		fake.emit('run_end', {result: {finalText: 'ok', stopReason: 'end_turn'}});
 	});
 	await settle();
 
-	assert.equal(fake.notices.length, 0, 'a delivery failure should not interrupt the session');
+	// The session carries on, but the failure is no longer invisible.
+	assert.equal(notices.length, 1);
+	assert.match(notices[0], /ECONNREFUSED/);
+});
+
+// ---------------------------------------------------------------------------
+// Failed deliveries are visible
+// ---------------------------------------------------------------------------
+
+test('a failed delivery says so instead of failing silently', async (t) => {
+	const {fake, notices} = withWebhook(t, {}, {ok: false, status: 401});
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.equal(notices.length, 1);
+	assert.match(notices[0], /could not be delivered/);
+	assert.match(notices[0], /HTTP 401/);
+});
+
+test('one outage warns once, however many notifications fail', async (t) => {
+	useFakeTimers(t);
+	const {fake, notices} = withWebhook(t, {}, {ok: false, status: 500});
+
+	for (let run = 0; run < 3; run += 1) {
+		fake.emit('run_start', {});
+		await fake.hook('onRunEnd', {result: {finalText: `run ${run}`, stopReason: 'end_turn'}});
+		t.mock.timers.tick(3000);
+	}
+
+	assert.equal(notices.length, 1, 'a broken webhook must not flood the feed');
+});
+
+test('a fetch failure names its underlying cause, not just "fetch failed"', async (t) => {
+	const {fake, notices} = withWebhook(t);
+	const cause = Object.assign(new Error('connect ECONNREFUSED'), {code: 'ECONNREFUSED'});
+	globalThis.fetch = (async () => {
+		throw Object.assign(new TypeError('fetch failed'), {cause});
+	}) as any;
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.match(notices[0], /ECONNREFUSED/);
+});
+
+test('a timed-out delivery is reported as such, not as a bare abort', async (t) => {
+	const {fake, notices} = withWebhook(t);
+	globalThis.fetch = (async () => {
+		throw Object.assign(new Error('The operation was aborted'), {name: 'AbortError'});
+	}) as any;
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.match(notices[0], /timed out/);
+});
+
+test('in print mode the warning goes to stderr, where it is actually visible', async (t) => {
+	const {fake, notices} = withWebhook(t, {}, {ok: false, status: 401});
+	// cmd.ui.notify prints nothing under cmd -p, so the mod must fall back to stderr.
+	fake.cmd.ui.capabilities.status = false;
+
+	const written: string[] = [];
+	const original = process.stderr.write;
+	process.stderr.write = ((chunk: any) => {
+		written.push(String(chunk));
+		return true;
+	}) as any;
+	t.after(() => {
+		process.stderr.write = original;
+	});
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'ok', stopReason: 'end_turn'}});
+
+	assert.match(written.join(''), /could not be delivered/);
+	assert.equal(notices.length, 0, 'must not also try the feed row');
+});
+
+test('a successful delivery is silent, and re-arms the warning', async (t) => {
+	useFakeTimers(t);
+	const response = {ok: false, status: 500};
+	const {fake, notices} = withWebhook(t, {}, response);
+
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'a', stopReason: 'end_turn'}});
+	assert.equal(notices.length, 1);
+
+	// It recovers: no warning, and the next failure should be reported afresh.
+	response.ok = true;
+	response.status = 204;
+	t.mock.timers.tick(3000);
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'b', stopReason: 'end_turn'}});
+	assert.equal(notices.length, 1, 'a success should be silent');
+
+	response.ok = false;
+	response.status = 403;
+	t.mock.timers.tick(3000);
+	fake.emit('run_start', {});
+	await fake.hook('onRunEnd', {result: {finalText: 'c', stopReason: 'end_turn'}});
+	assert.equal(notices.length, 2, 'a new outage warns again');
 });
 
 // ---------------------------------------------------------------------------

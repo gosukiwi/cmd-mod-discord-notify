@@ -148,6 +148,20 @@ function humanDuration(ms: number): string {
 	return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`;
 }
 
+// Node's fetch buries the real reason in `cause`, so a bare failure reads only
+// "fetch failed" — precisely the unhelpful message this is meant to avoid.
+function describeFetchError(error: unknown): string {
+	if (!(error instanceof Error)) return 'send failed';
+	if (error.name === 'AbortError') return 'timed out';
+	const cause = (error as {cause?: unknown}).cause;
+	let code: unknown;
+	if (cause && typeof cause === 'object') {
+		code = (cause as {code?: unknown}).code ?? (cause as {message?: unknown}).message;
+	}
+	const suffix = typeof code === 'string' && code !== '' ? ` (${code})` : '';
+	return `${error.message}${suffix}`;
+}
+
 function humanStopReason(raw: string): string {
 	return STOP_REASON_TEXT[raw] ?? raw.replaceAll('_', ' ');
 }
@@ -208,6 +222,7 @@ export default function (cmd: ModApi): void {
 	let permissionMode = 'default';
 	let lastOutcome: SendOutcome | undefined;
 	let warnedUnconfigured = false;
+	let warnedDeliveryFailure = false;
 	let cachedConfig: {mtimeMs: number; value: FileConfig} | undefined;
 
 	// Run context, so a ping can say what it was about rather than just that it happened.
@@ -279,12 +294,24 @@ export default function (cmd: ModApi): void {
 		};
 	}
 
+	// cmd.ui.notify draws a feed row in the interactive TUI but prints nothing at all under
+	// `cmd -p` (despite the docs saying headless prints a notice), and print mode is exactly
+	// where a delivery failure needs to be visible. So: feed row in the TUI, stderr
+	// otherwise — never both, so a raw write can't garble the TUI.
+	function warn(message: string): void {
+		if (cmd.ui?.capabilities?.status === true) {
+			cmd.ui.notify(message);
+			return;
+		}
+		process.stderr.write(`\n${message}\n`);
+	}
+
 	async function deliver(content: Ping): Promise<void> {
 		const settings = resolveSettings();
 		if (!settings.webhook) {
 			if (!warnedUnconfigured) {
 				warnedUnconfigured = true;
-				cmd.ui.notify(
+				warn(
 					`discord-notify: no webhook yet — add one to ${CONFIG_PATH}, then run /notify-test.`,
 				);
 			}
@@ -335,11 +362,25 @@ export default function (cmd: ModApi): void {
 		} catch (error) {
 			lastOutcome = {
 				ok: false,
-				detail: error instanceof Error ? error.message : 'send failed',
+				detail: describeFetchError(error),
 				at: Date.now(),
 			};
 		} finally {
 			clearTimeout(timer);
+		}
+
+		// A failed send used to be completely silent, which makes a broken webhook look
+		// exactly like a working one — the bug this cost the most time to find. Warn once per
+		// outage (a success re-arms it) so a misconfigured URL can't flood the feed.
+		if (lastOutcome.ok) {
+			warnedDeliveryFailure = false;
+			return;
+		}
+		if (!warnedDeliveryFailure) {
+			warnedDeliveryFailure = true;
+			warn(
+				`discord-notify: a notification could not be delivered (${lastOutcome.detail}). Run /notify-status for details.`,
+			);
 		}
 	}
 
