@@ -69,12 +69,3 @@ bin/uninstall --purge   # also delete the config (it holds your webhook URL)
   logged and never sent to the model.
 - `COMMANDCODE_MODS_DIR` overrides the install destination for both scripts.
 - After editing `discord-notify.ts`, re-run `bin/install` and `/reload`.
-
-## Credits
-
-The event-detection logic is adapted from
-[`cmd-mod-completion-bell`](https://github.com/timuela/commandcode-mods) (MIT, ©
-timuela1997), which established which Command Code events indicate the agent is blocked
-awaiting a human — the non-obvious part of this problem. This project keeps that mapping
-and replaces its local WAV playback with a Discord webhook so the ping reaches your phone.
-See [LICENSE](./LICENSE).

@@ -2,12 +2,6 @@ MIT License
 
 Copyright (c) 2026 Federico Ramirez
 
-The event-detection logic in discord-notify.ts is adapted from cmd-mod-completion-bell
-(https://github.com/timuela/commandcode-mods), which is licensed under the MIT License,
-Copyright (c) timuela1997. That upstream work established which Command Code events
-indicate the agent is blocked awaiting a human; this project reuses that mapping and
-replaces its local audio playback with a Discord webhook delivery path.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
