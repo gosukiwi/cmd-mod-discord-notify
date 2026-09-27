@@ -6,15 +6,23 @@ when the agent needs you — or when it finishes and you're away from the machin
 ## Install
 
 ```bash
-bin/install
+cmd mods add -g gosukiwi/cmd-mod-discord-notify
 ```
 
-This copies the mod to `~/.commandcode/mods/` (so it loads in every project) and writes a
-config template if you don't already have one. Restart Command Code, or run `/reload`.
+`-g` installs it user-wide, so it loads in every project — drop it to scope the mod to the
+current project instead. `cmd mods update` refreshes it after a new commit or tag.
+
+To try it without installing anything, load the file straight from a checkout:
+
+```bash
+cmd --mod ./discord-notify.ts
+```
+
+Either way, restart Command Code or run `/reload`, then [configure](#configure) your webhook.
 
 ## Configure
 
-Everything lives in `~/.commandcode/discord-notify.json`:
+Everything lives in `~/.commandcode/discord-notify.json`; create it with the template below:
 
 ```json
 {
@@ -85,8 +93,14 @@ quick succession both reach you.
 ## Uninstall
 
 ```bash
-bin/uninstall           # remove the mod, keep your config
-bin/uninstall --purge   # also delete the config (it holds your webhook URL)
+cmd mods remove discord-notify
+```
+
+That removes the mod; your config is deliberately left alone (it holds your webhook URL).
+Delete it too with:
+
+```bash
+rm ~/.commandcode/discord-notify.json
 ```
 
 ## Notes
@@ -97,8 +111,7 @@ bin/uninstall --purge   # also delete the config (it holds your webhook URL)
   reason (`HTTP 401`, `fetch failed (ECONNREFUSED)`, `timed out`). It appears as a feed row
   in the TUI, or on **stderr** under `cmd -p`, where `cmd.ui.notify` prints nothing.
   `/notify-status` shows the last outcome.
-- `COMMANDCODE_MODS_DIR` overrides the install destination for both scripts.
-- After editing `discord-notify.ts`, re-run `bin/install` and `/reload`.
+- After editing `discord-notify.ts`, run `/reload` — or iterate with `cmd --mod ./discord-notify.ts`.
 
 ## Tests
 

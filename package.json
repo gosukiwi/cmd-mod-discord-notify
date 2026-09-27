@@ -4,6 +4,9 @@
   "description": "Command Code mod that pings your phone on Discord when the agent needs your attention",
   "type": "module",
   "license": "MIT",
+  "commandcode": {
+    "mods": ["./discord-notify.ts"]
+  },
   "scripts": {
     "test": "node --test tests/*.test.ts"
   }
